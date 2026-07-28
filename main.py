@@ -1,3 +1,6 @@
+HOOK_STYLE = "photo_hook"     # 또는 "grid_card"
+QUOTE_STYLE = "typographic"   # 또는 "impact"
+
 """
 인스타그램 카드뉴스 완전자동 발행 스크립트 (GitHub Actions용)
 매일 스케줄에 맞춰 이 스크립트 하나만 실행되면 대본 생성부터 발행까지 끝까지 갑니다.
