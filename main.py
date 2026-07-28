@@ -8,6 +8,7 @@ import os
 import re
 import json
 import time
+import random
 import asyncio
 import requests
 from groq import Groq
@@ -81,6 +82,24 @@ def render_insight(theme, slide, page_num, total_pages):
                 <div style="font-size: 34px; line-height: 1.6; color: {theme['text_main']}; word-break: keep-all; white-space: pre-line;">
                     {slide.get('body', '')}
                 </div>
+            </div>
+            <div class="page-num">{page_num:02d} / {total_pages:02d}</div>
+        </div>
+    </body></html>
+    """
+
+
+def render_cover(theme, slide, page_num, total_pages):
+    return f"""
+    <html><head><style>{_base_style(theme)}</style></head><body>
+        <div class="frame">
+            <div style="font-size: 20px; letter-spacing: 2px; color: {theme['accent']}; font-weight: 500;
+                        display: inline-block; border-bottom: 2px solid {theme['accent']}; padding-bottom: 8px;">
+                {theme['brand_tag']}
+            </div>
+            <div style="font-family: {theme['font_serif']}; font-size: 66px; line-height: 1.35;
+                        color: {theme['text_main']}; font-weight: 600; word-break: keep-all;">
+                {slide.get('title', '')}
             </div>
             <div class="page-num">{page_num:02d} / {total_pages:02d}</div>
         </div>
@@ -172,6 +191,7 @@ def render_photo_hook(theme, slide, page_num, total_pages):
 
 
 TEMPLATES = {
+    "cover": render_cover,
     "insight": render_insight,
     "quote": render_quote,
     "cta": render_cta,
