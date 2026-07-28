@@ -1,4 +1,4 @@
-HOOK_STYLE = "photo_hook"     # 또는 "grid_card"
+HOOK_STYLE = "grid_card"     # 또는 "grid_card"
 QUOTE_STYLE = "typographic"   # 또는 "impact"
 
 """
