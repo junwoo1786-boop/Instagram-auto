@@ -25,7 +25,9 @@ INSTAGRAM_ID = "17841469531555718"
 
 TEXT_MODEL = "openai/gpt-oss-120b"
 USED_TOPICS_FILE = "used_topics.json"
-ALL_PHOTO_MODE = True
+ALL_PHOTO_MODE = True         # 항목 슬라이드에 사진 배경 쓸지 여부
+HOOK_STYLE = "photo_hook"     # 표지 스타일: "photo_hook"(원래) 또는 "grid_card"(신규)
+QUOTE_STYLE = "typographic"   # 인용구 스타일: "typographic"(원래) 또는 "impact"(신규, 사진+큰따옴표)
 
 # ----------------------------------------------------------
 # 2. 테마
@@ -190,12 +192,77 @@ def render_photo_hook(theme, slide, page_num, total_pages):
     """
 
 
+def render_grid_card(theme, slide, page_num, total_pages):
+    return f"""
+    <html><head><style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        {theme['font_import']}
+        body {{
+            width: 1080px; height: 1080px; font-family: {theme['font_sans']};
+            background-color: #F2F2F0; position: relative;
+            background-image: linear-gradient(#DCDCD8 1px, transparent 1px), linear-gradient(90deg, #DCDCD8 1px, transparent 1px);
+            background-size: 40px 40px;
+        }}
+        .top-bar {{ height: 28px; background: #000; }}
+    </style></head><body>
+        <div class="top-bar"></div>
+        <div style="position:absolute; top:60px; right:50px; background:#7A7A78; color:#fff; font-size:20px; font-weight:600; padding:8px 20px; border-radius:20px;">{page_num}/{total_pages}</div>
+        <div style="position:absolute; top:130px; left:50%; transform:translateX(-50%); width:64px; height:64px; border-radius:50%; background:#DCE7FB; display:flex; align-items:center; justify-content:center; font-size:26px; font-weight:700; color:#3E6FD9;">AI</div>
+        <div style="position:absolute; top:230px; width:100%; text-align:center; font-size:38px; font-weight:700; color:#181818; padding:0 60px; box-sizing:border-box; word-break: keep-all;">
+            {slide.get('title', '')}
+        </div>
+        <div style="position:absolute; top:340px; left:90px; right:90px; height:340px; background:#fff; border:2px solid #181818; padding:44px;">
+            <div style="font-size:30px; color:#181818; font-weight:700;">{slide.get('box_title', '')}</div>
+            <div style="font-size:19px; color:#666; margin-top:12px;">{slide.get('box_subtitle', '')}</div>
+        </div>
+        <div style="position:absolute; top:730px; left:90px;">
+            <span style="background:#CFE0FA; font-size:26px; font-weight:700; padding:5px 14px;">[{slide.get('tag_text', '')}]</span>
+        </div>
+        <div style="position:absolute; top:800px; width:100%; text-align:center; font-size:22px; color:#222; line-height:1.7; padding:0 90px; box-sizing:border-box; word-break: keep-all;">
+            {slide.get('body', '')}
+        </div>
+    </body></html>
+    """
+
+
+def render_quote_impact(theme, slide, page_num, total_pages):
+    image_url = slide.get("image_url", "")
+    return f"""
+    <html><head><style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        {theme['font_import']}
+        body {{ width: 1080px; height: 1080px; position: relative; overflow: hidden; font-family: {theme['font_sans']}; }}
+        .bg {{
+            position: absolute; inset: 0;
+            background-image: url('{image_url}');
+            background-size: cover; background-position: center;
+            filter: brightness(0.55) saturate(0.9);
+        }}
+        .scrim {{
+            position: absolute; inset: 0;
+            background: linear-gradient(0deg, rgba(0,0,0,0.95) 20%, rgba(0,0,0,0) 65%);
+        }}
+    </style></head><body>
+        <div class="bg"></div>
+        <div class="scrim"></div>
+        <div style="position:absolute; top:24px; left:24px; font-size:14px; letter-spacing:1px; color:#ccc; z-index:1;">{theme.get('logo_text', theme['brand_tag'])}</div>
+        <div style="position:absolute; left:60px; bottom:260px; font-family:Georgia,serif; font-size:90px; font-weight:800; color:#F2C744; line-height:0.6; z-index:1;">&ldquo;&rdquo;</div>
+        <div style="position:absolute; left:60px; bottom:120px; width:920px; font-size:44px; font-weight:800; line-height:1.4; color:#F2C744; word-break: keep-all; z-index:1;">
+            {slide.get('body', '')}
+        </div>
+        <div style="position:absolute; right:50px; bottom:40px; font-size:18px; color:#999; letter-spacing:1px; z-index:1;">{page_num}/{total_pages}</div>
+    </body></html>
+    """
+
+
 TEMPLATES = {
     "cover": render_cover,
     "insight": render_insight,
     "quote": render_quote,
+    "quote_impact": render_quote_impact,
     "cta": render_cta,
     "photo_hook": render_photo_hook,
+    "grid_card": render_grid_card,
 }
 
 
@@ -271,12 +338,14 @@ def generate_raw_script(topic):
 - items: 핵심 내용을 2~4개의 독립적인 항목으로 나눈 배열. 각 항목은
   title(그 항목을 한 줄로 요약), body(설명 2~3문장) {photo_field}
   hook에서 "N가지"라고 말했다면 items 배열의 길이도 반드시 N이어야 합니다.
-- quote: 임팩트 있는 한 문장 인용구
+- quote: 임팩트 있는 한 문장 인용구. quote_photo_query(영어 2~4단어, 특정 유명인이 아닌
+  일반적인 분위기/사람 사진 검색어, 예: "confident business person", "quiet office night")
 - cta: 마무리 요약 한두 문장
 
 [필수 규칙]
 - 한자나 중국어 표기는 절대 쓰지 마세요. 100% 순수 한글만 사용합니다.
 - photo_query는 영어로만 작성하세요.
+- quote_photo_query는 특정 실존 인물이 아니라 일반적인 분위기의 사진 검색어여야 합니다.
 
 JSON 형식으로만 응답하세요:
 {{
@@ -285,6 +354,7 @@ JSON 형식으로만 응답하세요:
     {{"title": "...", "body": "..."{', "photo_query": "..."' if ALL_PHOTO_MODE else ''}}}
   ],
   "quote": "...",
+  "quote_photo_query": "...",
   "cta": "..."
 }}
 """
@@ -299,18 +369,28 @@ def fix_hook_number(hook_title, item_count):
     return re.sub(r"\d+(가지|개)", f"{item_count}\\1", hook_title)
 
 
-def build_slides_from_raw(raw):
+def build_slides_from_raw(raw, topic=""):
     items = raw.get("items", [])
     n = len(items)
     hook = raw.get("hook", {})
     hook_title = fix_hook_number(hook.get("title", ""), n)
 
-    slides = [{
-        "layout": "photo_hook",
-        "title": hook_title,
-        "body": hook.get("body", ""),
-        "photo_query": hook.get("photo_query", ""),
-    }]
+    if HOOK_STYLE == "grid_card":
+        slides = [{
+            "layout": "grid_card",
+            "title": hook_title,
+            "body": hook.get("body", ""),
+            "box_title": topic,
+            "box_subtitle": "오늘의 카드뉴스",
+            "tag_text": topic,
+        }]
+    else:
+        slides = [{
+            "layout": "photo_hook",
+            "title": hook_title,
+            "body": hook.get("body", ""),
+            "photo_query": hook.get("photo_query", ""),
+        }]
 
     for i, item in enumerate(items, 1):
         slide = {
@@ -323,7 +403,11 @@ def build_slides_from_raw(raw):
             slide["photo_query"] = item.get("photo_query", "")
         slides.append(slide)
 
-    slides.append({"layout": "quote", "title": "", "body": raw.get("quote", "")})
+    quote_layout = "quote_impact" if QUOTE_STYLE == "impact" else "quote"
+    quote_slide = {"layout": quote_layout, "title": "", "body": raw.get("quote", "")}
+    if quote_layout == "quote_impact":
+        quote_slide["photo_query"] = raw.get("quote_photo_query", "")
+    slides.append(quote_slide)
     slides.append({"layout": "cta", "title": "", "body": raw.get("cta", "")})
     return slides
 
@@ -337,7 +421,7 @@ async def render_html_to_images(slides_data, theme, output_dir="./output_final")
     total_pages = len(slides_data)
 
     for slide in slides_data:
-        if slide.get("layout") == "photo_hook":
+        if slide.get("layout") in ("photo_hook", "quote_impact"):
             print(f"  Pexels에서 '{slide.get('photo_query', '')}' 사진 검색 중...")
             slide["image_url"] = fetch_pexels_photo(slide.get("photo_query", ""))
 
@@ -422,7 +506,7 @@ async def main():
     save_used_topic(topic)
 
     raw = generate_raw_script(topic)
-    slides_data = build_slides_from_raw(raw)
+    slides_data = build_slides_from_raw(raw, topic)
 
     image_paths = await render_html_to_images(slides_data, THEME)
     web_urls = [upload_image_to_web(p) for p in image_paths]
