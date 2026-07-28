@@ -1,5 +1,5 @@
 HOOK_STYLE = "grid_card"     # 또는 "grid_card"
-QUOTE_STYLE = "typographic"   # 또는 "impact"
+QUOTE_STYLE = "impact"   # 또는 "impact"
 
 """
 인스타그램 카드뉴스 완전자동 발행 스크립트 (GitHub Actions용)
