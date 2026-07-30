@@ -1,10 +1,20 @@
-HOOK_STYLE = "grid_card"     # 또는 "grid_card"
-QUOTE_STYLE = "impact"   # 또는 "impact"
-
 """
-인스타그램 카드뉴스 완전자동 발행 스크립트 (GitHub Actions용)
-매일 스케줄에 맞춰 이 스크립트 하나만 실행되면 대본 생성부터 발행까지 끝까지 갑니다.
-사람 개입 없음 (AUTO_MODE 고정).
+인스타그램 카드뉴스 완전자동 발행 엔진 (GitHub Actions용)
+
+이 파일은 "엔진"입니다 - 대본 생성, 사진 검색, 렌더링, 업로드, 발행을 담당합니다.
+디자인(템플릿)은 이 파일에 없고 templates/ 폴더 안의 파일들에 있습니다.
+
+새 디자인을 추가하고 싶으면:
+  1. templates/ 폴더에 새 파일(예: templates/my_new_style.py)을 추가
+  2. 그 안에 DISPLAY_NAME, NEEDS_PHOTO_HOOK 등 필요한 값과
+     render_hook / render_item / render_quote / render_cta 함수 4개를 정의
+  3. 이 main.py는 절대 건드릴 필요 없음 - 자동으로 인식됩니다.
+
+실행 방식:
+  - 기본: templates/ 폴더 안의 템플릿 중 랜덤으로 하나 골라서 사용
+  - TEMPLATE_NAME 환경변수가 지정되면: 그 이름의 템플릿을 강제로 사용
+  - CUSTOM_SCRIPT 환경변수(JSON 문자열)가 지정되면: 그록 대본 생성을 건너뛰고 그 내용을 사용
+    (깃허브 Actions "Run workflow" 수동 실행 시 입력창에 붙여넣으면 됨)
 """
 
 import os
@@ -13,12 +23,13 @@ import json
 import time
 import random
 import asyncio
+import importlib.util
 import requests
 from groq import Groq
 from playwright.async_api import async_playwright
 
 # ----------------------------------------------------------
-# 1. 자격 증명 - 깃허브 저장소 Settings > Secrets and variables > Actions 에 등록
+# 1. 자격 증명
 # ----------------------------------------------------------
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ACCESS_TOKEN = os.environ["INSTAGRAM_ACCESS_TOKEN"]
@@ -28,12 +39,15 @@ INSTAGRAM_ID = "17841469531555718"
 
 TEXT_MODEL = "openai/gpt-oss-120b"
 USED_TOPICS_FILE = "used_topics.json"
-ALL_PHOTO_MODE = True         # 항목 슬라이드에 사진 배경 쓸지 여부
-HOOK_STYLE = "photo_hook"     # 표지 스타일: "photo_hook"(원래) 또는 "grid_card"(신규)
-QUOTE_STYLE = "typographic"   # 인용구 스타일: "typographic"(원래) 또는 "impact"(신규, 사진+큰따옴표)
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+
+# 수동 실행 시 깃허브 Actions 입력창에서 넘어오는 값들 (비어있으면 자동 모드)
+TEMPLATE_NAME_OVERRIDE = os.environ.get("TEMPLATE_NAME", "").strip()
+CUSTOM_SCRIPT_OVERRIDE = os.environ.get("CUSTOM_SCRIPT", "").strip()
+TOPIC_OVERRIDE = os.environ.get("TOPIC_OVERRIDE", "").strip()
 
 # ----------------------------------------------------------
-# 2. 테마
+# 2. 공통 테마 (모든 템플릿이 공유하는 색/폰트 기본값. 템플릿 안에서 덮어써도 됨)
 # ----------------------------------------------------------
 THEME = {
     "bg": "#F6F1E7",
@@ -50,228 +64,36 @@ THEME = {
 }
 
 # ----------------------------------------------------------
-# 3. 슬라이드 템플릿
+# 3. 템플릿 동적 로딩
 # ----------------------------------------------------------
-
-def _base_style(theme):
-    return f"""
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        {theme['font_import']}
-        body {{
-            width: 1080px; height: 1080px;
-            background: {theme['bg']};
-            font-family: {theme['font_sans']};
-            display: flex; padding: 70px;
-            position: relative;
-        }}
-        body::after {{
-            content: "";
-            position: absolute; inset: 0;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-            opacity: 0.045; mix-blend-mode: multiply; pointer-events: none;
-        }}
-        .frame {{ width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: space-between; position: relative; z-index: 1; }}
-        .page-num {{ font-size: 20px; color: {theme['text_sub']}; letter-spacing: 1px; }}
-    """
+def load_templates():
+    """templates/ 폴더 안의 .py 파일들을 전부 모듈로 불러와서 {이름: 모듈} 딕셔너리로 반환"""
+    templates = {}
+    for fname in sorted(os.listdir(TEMPLATES_DIR)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        name = fname[:-3]
+        path = os.path.join(TEMPLATES_DIR, fname)
+        spec = importlib.util.spec_from_file_location(f"templates.{name}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        templates[name] = module
+    return templates
 
 
-def render_insight(theme, slide, page_num, total_pages):
-    number = slide.get("number", str(page_num))
-    return f"""
-    <html><head><style>{_base_style(theme)}</style></head><body>
-        <div class="frame">
-            <div style="font-size: 20px; color: {theme['text_sub']};">{slide.get('title', '')}</div>
-            <div>
-                <div style="font-family: {theme['font_serif']}; font-size: 130px; color: {theme['accent']}; line-height: 1;">{number}</div>
-                <div style="height: 2px; background: {theme['rule']}; margin: 30px 0;"></div>
-                <div style="font-size: 34px; line-height: 1.6; color: {theme['text_main']}; word-break: keep-all; white-space: pre-line;">
-                    {slide.get('body', '')}
-                </div>
-            </div>
-            <div class="page-num">{page_num:02d} / {total_pages:02d}</div>
-        </div>
-    </body></html>
-    """
+def choose_template(templates):
+    if TEMPLATE_NAME_OVERRIDE:
+        if TEMPLATE_NAME_OVERRIDE not in templates:
+            raise ValueError(
+                f"'{TEMPLATE_NAME_OVERRIDE}' 템플릿을 찾을 수 없습니다. "
+                f"사용 가능한 템플릿: {list(templates.keys())}"
+            )
+        print(f"[수동 지정] 템플릿: {TEMPLATE_NAME_OVERRIDE}")
+        return TEMPLATE_NAME_OVERRIDE, templates[TEMPLATE_NAME_OVERRIDE]
 
-
-def render_cover(theme, slide, page_num, total_pages):
-    return f"""
-    <html><head><style>{_base_style(theme)}</style></head><body>
-        <div class="frame">
-            <div style="font-size: 20px; letter-spacing: 2px; color: {theme['accent']}; font-weight: 500;
-                        display: inline-block; border-bottom: 2px solid {theme['accent']}; padding-bottom: 8px;">
-                {theme['brand_tag']}
-            </div>
-            <div style="font-family: {theme['font_serif']}; font-size: 66px; line-height: 1.35;
-                        color: {theme['text_main']}; font-weight: 600; word-break: keep-all;">
-                {slide.get('title', '')}
-            </div>
-            <div class="page-num">{page_num:02d} / {total_pages:02d}</div>
-        </div>
-    </body></html>
-    """
-
-
-def render_quote(theme, slide, page_num, total_pages):
-    return f"""
-    <html><head><style>
-        {_base_style(theme)}
-        body {{ background: {theme['bg_dark']}; }}
-    </style></head><body>
-        <div class="frame" style="justify-content: center; align-items: center; text-align: center;">
-            <div style="font-family: {theme['font_serif']}; font-size: 46px; line-height: 1.6;
-                        color: {theme['bg']}; font-style: italic; word-break: keep-all;">
-                "{slide.get('body', '')}"
-            </div>
-            <div style="width: 60px; height: 3px; background: {theme['accent']}; margin: 40px 0;"></div>
-            <div style="font-size: 18px; letter-spacing: 2px; color: {theme['rule']};">{page_num:02d} / {total_pages:02d}</div>
-        </div>
-    </body></html>
-    """
-
-
-def render_cta(theme, slide, page_num, total_pages):
-    return f"""
-    <html><head><style>{_base_style(theme)}</style></head><body>
-        <div class="frame">
-            <div style="font-size: 20px; color: {theme['text_sub']};">더 알아보기</div>
-            <div style="font-family: {theme['font_serif']}; font-size: 52px; line-height: 1.4;
-                        color: {theme['text_main']}; word-break: keep-all;">
-                {slide.get('body', '')}
-            </div>
-            <div style="font-size: 22px; color: {theme['accent']};">저장하고 다음 편 받아보기 →</div>
-        </div>
-    </body></html>
-    """
-
-
-def render_photo_hook(theme, slide, page_num, total_pages):
-    image_url = slide.get("image_url", "")
-    number_badge = ""
-    if slide.get("number"):
-        number_badge = f"""<div style="display:inline-block; background:rgba(255,255,255,0.18);
-            border-radius:8px; padding:4px 14px; font-size:20px; font-weight:700; margin-bottom:14px;">
-            {slide['number']}</div><br/>"""
-    return f"""
-    <html><head><style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        {theme['font_import']}
-        body {{ width: 1080px; height: 1080px; position: relative; overflow: hidden; font-family: {theme['font_sans']}; }}
-        .bg {{
-            position: absolute; inset: 0;
-            background-image: url('{image_url}');
-            background-size: cover; background-position: center;
-            filter: brightness(0.78) saturate(0.9);
-        }}
-        .scrim {{
-            position: absolute; inset: 0;
-            background: linear-gradient(to top, rgba(15,15,15,0.92) 0%, rgba(15,15,15,0.45) 42%, rgba(15,15,15,0) 68%);
-        }}
-        .content {{
-            position: relative; z-index: 1; width: 100%; height: 100%;
-            display: flex; flex-direction: column; justify-content: space-between;
-            padding: 55px 60px; color: #ffffff;
-        }}
-        .top-row {{ display: flex; justify-content: space-between; align-items: center; }}
-        .logo {{ font-size: 20px; font-weight: 700; letter-spacing: 1px; }}
-        .page-pill {{ background: rgba(255,255,255,0.16); border-radius: 20px; padding: 6px 18px; font-size: 16px; }}
-        .headline {{ font-size: 44px; font-weight: 800; line-height: 1.4; margin-bottom: 16px; word-break: keep-all; }}
-        .subhead {{ font-size: 24px; line-height: 1.6; color: rgba(255,255,255,0.85); word-break: keep-all; white-space: pre-line; }}
-    </style></head><body>
-        <div class="bg"></div>
-        <div class="scrim"></div>
-        <div class="content">
-            <div class="top-row">
-                <div class="logo">{theme.get('logo_text', theme['brand_tag'])}</div>
-                <div class="page-pill">{page_num}/{total_pages}</div>
-            </div>
-            <div>
-                {number_badge}
-                <div class="headline">{slide.get('title', '')}</div>
-                <div class="subhead">{slide.get('body', '')}</div>
-            </div>
-        </div>
-    </body></html>
-    """
-
-
-def render_grid_card(theme, slide, page_num, total_pages):
-    return f"""
-    <html><head><style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        {theme['font_import']}
-        body {{
-            width: 1080px; height: 1080px; font-family: {theme['font_sans']};
-            background-color: #F2F2F0; position: relative;
-            background-image: linear-gradient(#DCDCD8 1px, transparent 1px), linear-gradient(90deg, #DCDCD8 1px, transparent 1px);
-            background-size: 40px 40px;
-        }}
-        .top-bar {{ height: 28px; background: #000; }}
-    </style></head><body>
-        <div class="top-bar"></div>
-        <div style="position:absolute; top:60px; right:50px; background:#7A7A78; color:#fff; font-size:20px; font-weight:600; padding:8px 20px; border-radius:20px;">{page_num}/{total_pages}</div>
-        <div style="position:absolute; top:130px; left:50%; transform:translateX(-50%); width:64px; height:64px; border-radius:50%; background:#DCE7FB; display:flex; align-items:center; justify-content:center; font-size:26px; font-weight:700; color:#3E6FD9;">AI</div>
-        <div style="position:absolute; top:230px; width:100%; text-align:center; font-size:38px; font-weight:700; color:#181818; padding:0 60px; box-sizing:border-box; word-break: keep-all;">
-            {slide.get('title', '')}
-        </div>
-        <div style="position:absolute; top:340px; left:90px; right:90px; height:340px; background:#fff; border:2px solid #181818; padding:44px;">
-            <div style="font-size:30px; color:#181818; font-weight:700;">{slide.get('box_title', '')}</div>
-            <div style="font-size:19px; color:#666; margin-top:12px;">{slide.get('box_subtitle', '')}</div>
-        </div>
-        <div style="position:absolute; top:730px; left:90px;">
-            <span style="background:#CFE0FA; font-size:26px; font-weight:700; padding:5px 14px;">[{slide.get('tag_text', '')}]</span>
-        </div>
-        <div style="position:absolute; top:800px; width:100%; text-align:center; font-size:22px; color:#222; line-height:1.7; padding:0 90px; box-sizing:border-box; word-break: keep-all;">
-            {slide.get('body', '')}
-        </div>
-    </body></html>
-    """
-
-
-def render_quote_impact(theme, slide, page_num, total_pages):
-    image_url = slide.get("image_url", "")
-    return f"""
-    <html><head><style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        {theme['font_import']}
-        body {{ width: 1080px; height: 1080px; position: relative; overflow: hidden; font-family: {theme['font_sans']}; }}
-        .bg {{
-            position: absolute; inset: 0;
-            background-image: url('{image_url}');
-            background-size: cover; background-position: center;
-            filter: brightness(0.55) saturate(0.9);
-        }}
-        .scrim {{
-            position: absolute; inset: 0;
-            background: linear-gradient(0deg, rgba(0,0,0,0.95) 20%, rgba(0,0,0,0) 65%);
-        }}
-    </style></head><body>
-        <div class="bg"></div>
-        <div class="scrim"></div>
-        <div style="position:absolute; top:24px; left:24px; font-size:14px; letter-spacing:1px; color:#ccc; z-index:1;">{theme.get('logo_text', theme['brand_tag'])}</div>
-        <div style="position:absolute; left:60px; bottom:260px; font-family:Georgia,serif; font-size:90px; font-weight:800; color:#F2C744; line-height:0.6; z-index:1;">&ldquo;&rdquo;</div>
-        <div style="position:absolute; left:60px; bottom:120px; width:920px; font-size:44px; font-weight:800; line-height:1.4; color:#F2C744; word-break: keep-all; z-index:1;">
-            {slide.get('body', '')}
-        </div>
-        <div style="position:absolute; right:50px; bottom:40px; font-size:18px; color:#999; letter-spacing:1px; z-index:1;">{page_num}/{total_pages}</div>
-    </body></html>
-    """
-
-
-TEMPLATES = {
-    "cover": render_cover,
-    "insight": render_insight,
-    "quote": render_quote,
-    "quote_impact": render_quote_impact,
-    "cta": render_cta,
-    "photo_hook": render_photo_hook,
-    "grid_card": render_grid_card,
-}
-
-
-def render_slide_html(theme, slide, page_num, total_pages):
-    fn = TEMPLATES.get(slide.get("layout", "insight"), render_insight)
-    return fn(theme, slide, page_num, total_pages)
+    name = random.choice(list(templates.keys()))
+    print(f"[랜덤 선택] 템플릿: {name}")
+    return name, templates[name]
 
 
 def fetch_pexels_photo(query, orientation="square"):
@@ -288,7 +110,7 @@ def fetch_pexels_photo(query, orientation="square"):
 
 
 # ----------------------------------------------------------
-# 4. 주제 후보 생성 (최근 사용 주제는 used_topics.json에 커밋되어 다음 실행에 반영됨)
+# 4. 주제 후보 생성
 # ----------------------------------------------------------
 def load_used_topics():
     if os.path.exists(USED_TOPICS_FILE):
@@ -327,9 +149,11 @@ JSON 배열로만 응답해라. ["주제1", "주제2", ...]
     return json.loads(json_str)
 
 
-def generate_raw_script(topic):
+def generate_raw_script(topic, needs_hook_photo, needs_item_photo, needs_quote_photo):
     client = Groq(api_key=GROQ_API_KEY)
-    photo_field = '"photo_query": "영어 2~4단어 사진 검색어",' if ALL_PHOTO_MODE else ""
+
+    def photo_field():
+        return '"photo_query": "영어 2~4단어 사진 검색어",'
 
     prompt = f"""
 당신은 인스타그램 비즈니스 카드뉴스 전문 에디터입니다.
@@ -337,27 +161,26 @@ def generate_raw_script(topic):
 
 카드뉴스 구조:
 - hook: 표지. title(이모지+굵은 후킹 문구, 숫자를 언급한다면 반드시 items 배열 개수와 정확히 일치해야 함),
-  body(보조 설명 1~2문장) {photo_field}
+  body(보조 설명 1~2문장) {photo_field() if needs_hook_photo else ""}
 - items: 핵심 내용을 2~4개의 독립적인 항목으로 나눈 배열. 각 항목은
-  title(그 항목을 한 줄로 요약), body(설명 2~3문장) {photo_field}
+  title(그 항목을 한 줄로 요약), body(설명 2~3문장) {photo_field() if needs_item_photo else ""}
   hook에서 "N가지"라고 말했다면 items 배열의 길이도 반드시 N이어야 합니다.
-- quote: 임팩트 있는 한 문장 인용구. quote_photo_query(영어 2~4단어, 특정 유명인이 아닌
-  일반적인 분위기/사람 사진 검색어, 예: "confident business person", "quiet office night")
+- quote: 임팩트 있는 한 문장 인용구
+  {'quote_photo_query(영어 2~4단어, 특정 유명인이 아닌 일반적인 분위기/사람 사진 검색어)' if needs_quote_photo else ''}
 - cta: 마무리 요약 한두 문장
 
 [필수 규칙]
 - 한자나 중국어 표기는 절대 쓰지 마세요. 100% 순수 한글만 사용합니다.
 - photo_query는 영어로만 작성하세요.
-- quote_photo_query는 특정 실존 인물이 아니라 일반적인 분위기의 사진 검색어여야 합니다.
+{'- quote_photo_query는 특정 실존 인물이 아니라 일반적인 분위기의 사진 검색어여야 합니다.' if needs_quote_photo else ''}
 
 JSON 형식으로만 응답하세요:
 {{
-  "hook": {{"title": "...", "body": "..."{', "photo_query": "..."' if ALL_PHOTO_MODE else ''}}},
+  "hook": {{"title": "...", "body": "..."{', "photo_query": "..."' if needs_hook_photo else ''}}},
   "items": [
-    {{"title": "...", "body": "..."{', "photo_query": "..."' if ALL_PHOTO_MODE else ''}}}
+    {{"title": "...", "body": "..."{', "photo_query": "..."' if needs_item_photo else ''}}}
   ],
-  "quote": "...",
-  "quote_photo_query": "...",
+  "quote": "..."{', "quote_photo_query": "..."' if needs_quote_photo else ''},
   "cta": "..."
 }}
 """
@@ -372,59 +195,64 @@ def fix_hook_number(hook_title, item_count):
     return re.sub(r"\d+(가지|개)", f"{item_count}\\1", hook_title)
 
 
-def build_slides_from_raw(raw, topic=""):
+def build_slides_from_raw(raw, topic, template):
     items = raw.get("items", [])
     n = len(items)
     hook = raw.get("hook", {})
     hook_title = fix_hook_number(hook.get("title", ""), n)
 
-    if HOOK_STYLE == "grid_card":
-        slides = [{
-            "layout": "grid_card",
-            "title": hook_title,
-            "body": hook.get("body", ""),
-            "box_title": topic,
-            "box_subtitle": "오늘의 카드뉴스",
-            "tag_text": topic,
-        }]
-    else:
-        slides = [{
-            "layout": "photo_hook",
-            "title": hook_title,
-            "body": hook.get("body", ""),
-            "photo_query": hook.get("photo_query", ""),
-        }]
+    slides = [{
+        "role": "hook",
+        "title": hook_title,
+        "body": hook.get("body", ""),
+        "photo_query": hook.get("photo_query", ""),
+        "topic": topic,
+    }]
 
     for i, item in enumerate(items, 1):
-        slide = {
-            "layout": "photo_hook" if ALL_PHOTO_MODE else "insight",
+        slides.append({
+            "role": "item",
             "title": f"{i}. {item.get('title', '')}",
             "body": item.get("body", ""),
             "number": f"{i:02d}",
-        }
-        if ALL_PHOTO_MODE:
-            slide["photo_query"] = item.get("photo_query", "")
-        slides.append(slide)
+            "photo_query": item.get("photo_query", ""),
+        })
 
-    quote_layout = "quote_impact" if QUOTE_STYLE == "impact" else "quote"
-    quote_slide = {"layout": quote_layout, "title": "", "body": raw.get("quote", "")}
-    if quote_layout == "quote_impact":
-        quote_slide["photo_query"] = raw.get("quote_photo_query", "")
-    slides.append(quote_slide)
-    slides.append({"layout": "cta", "title": "", "body": raw.get("cta", "")})
+    slides.append({
+        "role": "quote",
+        "title": "",
+        "body": raw.get("quote", ""),
+        "photo_query": raw.get("quote_photo_query", ""),
+    })
+    slides.append({"role": "cta", "title": "", "body": raw.get("cta", "")})
     return slides
 
 
 # ----------------------------------------------------------
-# 5. 렌더링
+# 5. 렌더링 (선택된 템플릿의 render_* 함수를 role에 맞게 호출)
 # ----------------------------------------------------------
-async def render_html_to_images(slides_data, theme, output_dir="./output_final"):
+ROLE_RENDER_MAP = {
+    "hook": "render_hook",
+    "item": "render_item",
+    "quote": "render_quote",
+    "cta": "render_cta",
+}
+ROLE_PHOTO_FLAG = {
+    "hook": "NEEDS_PHOTO_HOOK",
+    "item": "NEEDS_PHOTO_ITEM",
+    "quote": "NEEDS_PHOTO_QUOTE",
+}
+
+
+async def render_html_to_images(slides_data, theme, template, output_dir="./output_final"):
     os.makedirs(output_dir, exist_ok=True)
     image_paths = []
     total_pages = len(slides_data)
 
     for slide in slides_data:
-        if slide.get("layout") in ("photo_hook", "quote_impact"):
+        flag_name = ROLE_PHOTO_FLAG.get(slide["role"])
+        needs_photo = flag_name and getattr(template, flag_name, False)
+        if needs_photo:
             print(f"  Pexels에서 '{slide.get('photo_query', '')}' 사진 검색 중...")
             slide["image_url"] = fetch_pexels_photo(slide.get("photo_query", ""))
 
@@ -433,12 +261,13 @@ async def render_html_to_images(slides_data, theme, output_dir="./output_final")
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1080, "height": 1080})
         for idx, slide in enumerate(slides_data, start=1):
-            html_content = render_slide_html(theme, slide, idx, total_pages)
+            render_fn = getattr(template, ROLE_RENDER_MAP[slide["role"]])
+            html_content = render_fn(theme, slide, idx, total_pages)
             await page.set_content(html_content, wait_until="networkidle")
             file_path = os.path.join(output_dir, f"slide_{idx}.png")
             await page.screenshot(path=file_path)
             image_paths.append(file_path)
-            print(f"  [{idx}/{total_pages}] {slide.get('layout')} 슬라이드 완료")
+            print(f"  [{idx}/{total_pages}] {slide['role']} 슬라이드 완료")
         await browser.close()
     return image_paths
 
@@ -503,15 +332,31 @@ def publish_to_instagram(web_image_urls, caption):
 # 7. 실행
 # ----------------------------------------------------------
 async def main():
-    candidates = generate_topic_candidates()
-    topic = candidates[0]
-    print(f"오늘의 주제: {topic}")
+    templates = load_templates()
+    print(f"사용 가능한 템플릿: {list(templates.keys())}")
+    template_name, template = choose_template(templates)
+
+    if TOPIC_OVERRIDE:
+        topic = TOPIC_OVERRIDE
+        print(f"[수동 지정] 주제: {topic}")
+    else:
+        candidates = generate_topic_candidates()
+        topic = random.choice(candidates)
+        print(f"오늘의 주제: {topic}")
     save_used_topic(topic)
 
-    raw = generate_raw_script(topic)
-    slides_data = build_slides_from_raw(raw, topic)
+    if CUSTOM_SCRIPT_OVERRIDE:
+        print("[수동 지정] 대본을 직접 입력한 내용으로 사용합니다.")
+        raw = json.loads(CUSTOM_SCRIPT_OVERRIDE)
+    else:
+        needs_hook_photo = getattr(template, "NEEDS_PHOTO_HOOK", False)
+        needs_item_photo = getattr(template, "NEEDS_PHOTO_ITEM", False)
+        needs_quote_photo = getattr(template, "NEEDS_PHOTO_QUOTE", False)
+        raw = generate_raw_script(topic, needs_hook_photo, needs_item_photo, needs_quote_photo)
 
-    image_paths = await render_html_to_images(slides_data, THEME)
+    slides_data = build_slides_from_raw(raw, topic, template)
+
+    image_paths = await render_html_to_images(slides_data, THEME, template)
     web_urls = [upload_image_to_web(p) for p in image_paths]
 
     caption = f"{topic}\n\n#비즈니스 #자기계발 #스타트업 #카드뉴스"
