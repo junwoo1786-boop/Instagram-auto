@@ -33,7 +33,7 @@ from playwright.async_api import async_playwright
 # ----------------------------------------------------------
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 ACCESS_TOKEN = os.environ["INSTAGRAM_ACCESS_TOKEN"]
-IMGBB_API_KEY = os.environ["IMGBB_API_KEY"]
+IMGBB_API_KEY = os.environ.get("IMGBB_API_KEY", "")  # 더 이상 사용 안 함 (호환용으로만 남김)
 PEXELS_API_KEY = os.environ["PEXELS_API_KEY"]
 INSTAGRAM_ID = "17841469531555718"
 
@@ -276,12 +276,36 @@ async def render_html_to_images(slides_data, theme, template, output_dir="./outp
 # 6. 업로드 & 발행
 # ----------------------------------------------------------
 def upload_image_to_web(image_path):
+    """레거시 - 더 이상 사용하지 않음 (ImgBB가 메타 서버에서 가끔 못 읽는 문제가 있어서 교체함)"""
     url = "https://api.imgbb.com/1/upload"
     with open(image_path, "rb") as file:
         payload = {"key": IMGBB_API_KEY}
         files = {"image": file}
         res = requests.post(url, data=payload, files=files).json()
         return res["data"]["url"]
+
+
+def commit_and_get_raw_urls(image_paths):
+    """생성된 이미지를 깃허브 저장소에 커밋하고, raw.githubusercontent.com URL로 반환.
+    ImgBB보다 메타 서버가 훨씬 안정적으로 읽어옴."""
+    import subprocess
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "")  # 예: junwoo1786-boop/Instagram-auto
+    if not repo:
+        raise RuntimeError("GITHUB_REPOSITORY 환경변수가 없습니다. 깃허브 액션 밖에서는 이 함수를 쓸 수 없어요.")
+
+    subprocess.run(["git", "config", "user.name", "card-news-bot"], check=True)
+    subprocess.run(["git", "config", "user.email", "actions@github.com"], check=True)
+    subprocess.run(["git", "add"] + image_paths, check=True)
+    result = subprocess.run(["git", "commit", "-m", "카드뉴스 이미지 업데이트"], capture_output=True, text=True)
+    if result.returncode != 0 and "nothing to commit" not in result.stdout:
+        print(f"  (커밋 경고: {result.stdout} {result.stderr})")
+    subprocess.run(["git", "push"], check=True)
+
+    print("이미지를 깃허브에 커밋했습니다. 메타 서버 캐시 반영 대기 (8초)...")
+    time.sleep(8)
+
+    return [f"https://raw.githubusercontent.com/{repo}/main/{p}" for p in image_paths]
 
 
 def publish_to_instagram(web_image_urls, caption):
@@ -357,7 +381,7 @@ async def main():
     slides_data = build_slides_from_raw(raw, topic, template)
 
     image_paths = await render_html_to_images(slides_data, THEME, template)
-    web_urls = [upload_image_to_web(p) for p in image_paths]
+    web_urls = commit_and_get_raw_urls(image_paths)
 
     caption = f"{topic}\n\n#비즈니스 #자기계발 #스타트업 #카드뉴스"
     publish_to_instagram(web_urls, caption)
